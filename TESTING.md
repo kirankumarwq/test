@@ -1,0 +1,65 @@
+# Manual Testing Guide
+
+This document provides instructions for manually testing the core features of the application.
+
+## 1. Prerequisites
+
+Before you begin, ensure you have completed the following steps:
+
+1.  **Install Dependencies:** Open your terminal in the project root and run:
+    ```bash
+    npm install
+    ```
+    *(Note: This assumes you are using npm. If you use yarn or pnpm, use the corresponding command.)*
+
+2.  **Set Up Environment Variables:**
+    -   Create a file named `.env.local` in the project root.
+    -   Add your Supabase project URL and anon key to this file. You can get these from your Supabase project dashboard under `Settings > API`.
+
+    ```
+    NEXT_PUBLIC_SUPABASE_URL=your-supabase-project-url
+    NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
+    ```
+
+3.  **Run the Development Server:**
+    ```bash
+    npm run dev
+    ```
+    The application should now be running at `http://localhost:3000`.
+
+---
+
+## 2. Authentication Flow Testing
+
+### Test Case 2.1: User Sign-Up
+
+**Objective:** Verify that a new user can create an account and receives a confirmation email.
+
+**Steps:**
+
+1.  Open your browser and navigate to `http://localhost:3000/signup`.
+2.  The form defaults to "Sign In" mode. Click the **"Need an account?"** link at the bottom right of the form. The button text should change to "Sign Up".
+3.  Enter a valid email address that you have access to.
+4.  Enter a secure password (Supabase requires a minimum of 6 characters).
+5.  Click the **"Sign Up"** button.
+
+**Expected Result:**
+-   You should be redirected to the home page with a message in the URL, like `/?message=Check-email-to-confirm-account`.
+-   Go to your Supabase project dashboard and check the `Authentication > Users` section. You should see the new user with the email you provided, waiting for verification.
+-   Check your email inbox for the confirmation email from Supabase.
+
+### Test Case 2.2: User Sign-In
+
+**Objective:** Verify that a confirmed user can successfully log in.
+
+**Prerequisite:** You must have a confirmed user. Either click the link in the confirmation email from the previous test case or manually confirm the user in your Supabase dashboard.
+
+**Steps:**
+1.  Navigate to `http://localhost:3000/login`.
+2.  The form should be in "Sign In" mode by default.
+3.  Enter the email and password of the **confirmed** user.
+4.  Click the **"Sign In"** button.
+
+**Expected Result:**
+-   You should be successfully redirected to the patient dashboard page at `http://localhost:3000/patient/dashboard`. Although this page is currently a placeholder, the redirect itself confirms that the login was successful.
+-   Subsequent visits to protected pages should work without requiring a new login, as Supabase sets a session cookie.
