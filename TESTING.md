@@ -63,3 +63,38 @@ Before you begin, ensure you have completed the following steps:
 **Expected Result:**
 -   You should be successfully redirected to the patient dashboard page at `http://localhost:3000/patient/dashboard`. Although this page is currently a placeholder, the redirect itself confirms that the login was successful.
 -   Subsequent visits to protected pages should work without requiring a new login, as Supabase sets a session cookie.
+
+---
+
+## 3. Doctor's Availability Management
+
+### Prerequisite: Create a Doctor User
+
+This feature is only accessible to users with the `doctor` role. To create one for testing:
+
+1.  **Sign up a new user** using the flow described in Test Case 2.1 and confirm their email.
+2.  Go to your **Supabase Dashboard**.
+3.  Navigate to **Table Editor > `profiles`**.
+4.  Find the new user's profile and change their `role` from `patient` to `doctor`.
+5.  Navigate to **Table Editor > `doctors`**.
+6.  Click **"+ Insert row"**.
+7.  Set the `id` to be the same user ID from the `profiles` table.
+8.  Choose a `specialty_id` (you may need to add a specialty in the `specialties` table first if it's empty).
+9.  Click **Save**. You now have a doctor account.
+
+### Test Case 3.1: Add an Availability Slot
+
+**Objective:** Verify that a logged-in doctor can add a new availability slot to their schedule.
+
+**Steps:**
+
+1.  Log in to the application using the **doctor account** you just configured. You should be redirected to the patient dashboard.
+2.  Manually navigate to the doctor's dashboard at `http://localhost:3000/doctor/dashboard`.
+3.  On the left side, you'll see the **"Manage Your Availability"** form.
+4.  Select a future date and a valid start/end time (e.g., 10:00 AM to 11:00 AM).
+5.  Click the **"Add Availability"** button.
+
+**Expected Result:**
+-   A success message should appear below the form (e.g., "Successfully added availability for...").
+-   The page will refresh, and the new time slot will appear in the **"Your Upcoming Availability"** list on the right side.
+-   You can verify in your Supabase Dashboard under **Table Editor > `availability`** that a new row has been created with the correct `doctor_id`, `start_time`, and `end_time`.
