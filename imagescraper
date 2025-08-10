@@ -1,0 +1,566 @@
+"""
+universal_image_scraper_gui_windows_headless.py
+
+Windows-ready, headless Selenium universal image scraper with Tkinter GUI and progress bar.
+
+Features:
+- Headless Chrome via selenium-wire + webdriver-manager
+- Network capture to collect image resources
+- Blob->dataURI conversion in-browser
+- Extracts <img> (src, srcset, data-*), inline CSS background-image, JSON-LD, og:image
+- Screenshot fallback when direct download fails
+- Multi-threaded downloads with resume (skips existing files)
+- Auto-categorization via breadcrumbs or URL path
+- Tkinter GUI: URL input, Start/Stop, log window, progress bar
+
+Dependencies:
+pip install selenium-wire selenium webdriver-manager beautifulsoup4 requests python-slugify tqdm pillow
+
+Run:
+python universal_image_scraper_gui_windows_headless.py
+
+Build .exe (optional):
+pip install pyinstaller
+pyinstaller --onefile --add-data "<python_path>\Lib\site-packages\webdriver_manager;webdriver_manager" universal_image_scraper_gui_windows_headless.py
+
+Note: On Windows, webdriver_manager downloads ChromeDriver automatically. Headless mode is enabled by default.
+"""
+
+import os, re, time, json, base64, hashlib, shutil, logging, threading
+from urllib.parse import urljoin, urlparse, unquote, urldefrag
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from bs4 import BeautifulSoup
+from slugify import slugify
+from PIL import Image
+from io import BytesIO
+import urllib.robotparser
+
+# selenium + selenium-wire
+from seleniumwire import webdriver  # pip install selenium-wire
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import WebDriverException
+
+# Tkinter GUI
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+
+# ---------- CONFIG ----------
+DEFAULT_START = "https://uniformtailor.in"
+OUTPUT_DIR = "images"
+USER_AGENT = "UniversalImageScraper/1.0"
+MAX_PAGES = 2000
+REQUEST_DELAY = 0.6
+DOWNLOAD_WORKERS = 6
+PAGE_RENDER_WAIT = 1.0
+SCROLL_PAUSE = 0.5
+MAX_SCROLL_CYCLES = 6
+ROBOTS_CHECK = True
+# --------------------------------
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+session = requests.Session()
+session.headers.update({"User-Agent": USER_AGENT})
+
+# ----------------- Utilities -----------------
+def normalize_url(href, base):
+    if not href: return None
+    href = href.strip()
+    href = urljoin(base, href)
+    href, _ = urldefrag(href)
+    parsed = urlparse(href)
+    if parsed.scheme not in ("http","https"): return None
+    return href
+
+def safe_name(s):
+    s = unquote(str(s or ""))
+    return slugify(s)[:160] or "unnamed"
+
+def ensure_unique_filepath(folder, basename):
+    os.makedirs(folder, exist_ok=True)
+    base, ext = os.path.splitext(basename)
+    if not ext:
+        ext = ".jpg"
+    candidate = os.path.join(folder, base + ext)
+    i = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(folder, f"{base}_{i}{ext}")
+        i += 1
+    return candidate
+
+def save_binary(content_bytes, out_path):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "wb") as f:
+        f.write(content_bytes)
+
+def download_url_to_path(url, out_path, timeout=20, referer=None):
+    if not url: return False
+    if url.startswith("data:"):
+        try:
+            header, b64 = url.split(",", 1)
+            save_binary(base64.b64decode(b64), out_path)
+            return True
+        except Exception:
+            return False
+    headers = {"User-Agent": USER_AGENT}
+    if referer: headers["Referer"] = referer
+    try:
+        r = session.get(url, stream=True, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            with open(out_path, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+            return True
+    except Exception:
+        return False
+    return False
+
+# ----------------- Selenium driver -----------------
+def setup_driver(headless=True):
+    opts = Options()
+    if headless:
+        # uses new headless mode where supported
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"user-agent={USER_AGENT}")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option('useAutomationExtension', False)
+    seleniumwire_options = {}
+    try:
+        driver = webdriver.Chrome(ChromeDriverManager().install(), options=opts, seleniumwire_options=seleniumwire_options)
+    except WebDriverException as e:
+        logging.error("Chrome driver error: %s", e)
+        raise
+    driver.scopes = ['.*']
+    return driver
+
+# JS helper: convert blob: images to data URLs
+BLOB_TO_DATAJS = """
+(async function() {
+    const imgs = Array.from(document.querySelectorAll('img'));
+    const results = [];
+    for (const img of imgs) {
+        const src = img.src || '';
+        if (!src.startsWith('blob:')) continue;
+        try {
+            const resp = await fetch(src);
+            const blob = await resp.blob();
+            const reader = new FileReader();
+            const p = new Promise((res, rej) => {
+                reader.onloadend = () => res(reader.result);
+                reader.onerror = rej;
+            });
+            reader.readAsDataURL(blob);
+            const dataUrl = await p;
+            results.push({src: src, data: dataUrl});
+        } catch(e){}
+    }
+    return results;
+})();
+"""
+
+# ----------------- Extraction & processing -----------------
+def extract_from_soup(soup, page_url):
+    imgs = set()
+    for img in soup.find_all("img"):
+        for attr in ("src","data-src","data-lazy-src","data-original","data-zoom-image"):
+            v = img.get(attr)
+            if v:
+                u = normalize_url(v, base=page_url)
+                if u: imgs.add(u)
+        ss = img.get("srcset")
+        if ss:
+            for part in [p.strip().split(" ")[0] for p in ss.split(",") if p.strip()]:
+                u = normalize_url(part, base=page_url)
+                if u: imgs.add(u)
+    for el in soup.find_all(style=True):
+        st = el.get("style") or ""
+        for m in re.findall(r'url\(([^)]+)\)', st):
+            u = m.strip('\'\" ')
+            u2 = normalize_url(u, base=page_url)
+            if u2: imgs.add(u2)
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "{}")
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        for it in items:
+            if isinstance(it, dict):
+                for key in ("image","images","thumbnailUrl"):
+                    if key in it:
+                        val = it[key]
+                        if isinstance(val, str):
+                            u = normalize_url(val, base=page_url)
+                            if u: imgs.add(u)
+                        elif isinstance(val, list):
+                            for v in val:
+                                if isinstance(v, str):
+                                    u = normalize_url(v, base=page_url)
+                                    if u: imgs.add(u)
+    for m in soup.find_all("meta", {"property": ["og:image","twitter:image"]}):
+        c = m.get("content")
+        if c:
+            u = normalize_url(c, base=page_url)
+            if u: imgs.add(u)
+    return imgs
+
+def collect_network_images(driver, page_url, root_domain):
+    found = set()
+    try:
+        for req in driver.requests:
+            try:
+                if req.response and 'content-type' in req.response.headers:
+                    ct = req.response.headers.get('content-type','').lower()
+                    if 'image' in ct or req.path.lower().endswith(('.jpg','.jpeg','.png','.gif','.webp','.avif')):
+                        u = req.url
+                        u2 = normalize_url(u, base=page_url)
+                        if u2 and urlparse(u2).netloc == root_domain:
+                            found.add(u2)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return found
+
+def page_scroll(driver):
+    last_h = driver.execute_script("return document.body.scrollHeight")
+    for i in range(MAX_SCROLL_CYCLES):
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(SCROLL_PAUSE)
+        new_h = driver.execute_script("return document.body.scrollHeight")
+        if new_h == last_h:
+            break
+        last_h = new_h
+
+def get_breadcrumbs_from_soup(soup):
+    bc = []
+    selectors = ['nav[aria-label*="breadcrumb"]', '.breadcrumb', '.breadcrumbs', '.breadcrumb-list','ol.breadcrumb','ul.breadcrumb']
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el:
+            for a in el.find_all(["a","span","li"]):
+                t = (a.get_text(strip=True) or "")
+                if t:
+                    bc.append(t)
+            if bc:
+                return bc
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "{}")
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        for it in items:
+            if isinstance(it, dict) and it.get("@type","").lower()=="breadcrumblist":
+                names = []
+                for item in it.get("itemListElement", []):
+                    nm = item.get("name") or (item.get("item",{}).get("name") if isinstance(item.get("item"), dict) else None)
+                    if nm: names.append(nm)
+                if names: return names
+    return []
+
+def derive_folder_from_meta(url, title, breadcrumbs):
+    if breadcrumbs and len(breadcrumbs) >= 2:
+        cat = safe_name(breadcrumbs[0]); sub = safe_name(breadcrumbs[1])
+    elif breadcrumbs and len(breadcrumbs) == 1:
+        cat = safe_name(breadcrumbs[0]); sub = "general"
+    else:
+        parts = [p for p in urlparse(url).path.split("/") if p]
+        cat = safe_name(parts[0]) if parts else "uncategorized"
+        sub = safe_name(parts[1]) if len(parts)>1 else "general"
+    product = safe_name(title or (parts[-1] if parts else "product"))
+    folder = os.path.join(OUTPUT_DIR, cat, sub, product)
+    return folder
+
+def element_screenshot_by_src(driver, page_url, img_src, out_path):
+    try:
+        imgs = driver.find_elements("tag name", "img")
+        for el in imgs:
+            try:
+                src = el.get_attribute("src") or ""
+                data_src = el.get_attribute("data-src") or ""
+                srcset = el.get_attribute("srcset") or ""
+                if img_src in src or img_src in data_src or img_src in srcset:
+                    png = el.screenshot_as_png
+                    save_binary(png, out_path)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        png = driver.get_screenshot_as_png()
+        save_binary(png, out_path)
+        return True
+    except Exception:
+        return False
+
+# ----------------- Main crawling/worker functions -----------------
+class ScraperController:
+    def __init__(self, start_url, log_fn, progress_fn):
+        self.start_url = start_url
+        self.log_fn = log_fn
+        self.progress_fn = progress_fn
+        self.stop_event = threading.Event()
+        self.tasks = []  # (img_url_or_dataURI, folder, page_url)
+        self.visited = set()
+        parsed = urlparse(start_url)
+        self.root_domain = parsed.netloc
+        # robots
+        self.rp = urllib.robotparser.RobotFileParser()
+        try:
+            self.rp.set_url(urljoin(start_url, "/robots.txt"))
+            self.rp.read()
+        except Exception:
+            pass
+
+    def allowed_by_robots(self, url):
+        if not ROBOTS_CHECK:
+            return True
+        try:
+            return self.rp.can_fetch(USER_AGENT, url)
+        except Exception:
+            return True
+
+    def crawl(self):
+        driver = setup_driver(headless=True)
+        to_visit = [self.start_url]
+        pages_processed = 0
+        try:
+            while to_visit and pages_processed < MAX_PAGES and not self.stop_event.is_set():
+                url = to_visit.pop(0)
+                if url in self.visited: continue
+                self.visited.add(url)
+                if not self.allowed_by_robots(url):
+                    self.log_fn(f"robots.txt disallow: {url}")
+                    continue
+                self.log_fn(f"Visiting: {url}")
+                driver.requests.clear()
+                try:
+                    driver.get(url)
+                except Exception as e:
+                    self.log_fn(f"Failed to load {url}: {e}")
+                    continue
+                time.sleep(PAGE_RENDER_WAIT)
+                page_scroll(driver)
+                time.sleep(0.2)
+                page_html = driver.page_source
+                soup = BeautifulSoup(page_html, "html.parser")
+                title = ""
+                h1 = soup.find("h1")
+                if h1: title = h1.get_text(strip=True)
+                breadcrumbs = get_breadcrumbs_from_soup(soup)
+                folder = derive_folder_from_meta(url, title, breadcrumbs)
+                dom_imgs = extract_from_soup(soup, url)
+                net_imgs = collect_network_images(driver, url, self.root_domain)
+                blob_map = {}
+                try:
+                    blob_results = driver.execute_script(BLOB_TO_DATAJS)
+                    for item in (blob_results or []):
+                        s = item.get("src"); d = item.get("data")
+                        if s and d: blob_map[s] = d
+                except Exception:
+                    pass
+                all_imgs = set(dom_imgs) | net_imgs
+                for bsrc, datauri in blob_map.items():
+                    all_imgs.add(datauri)
+                for img in all_imgs:
+                    self.tasks.append((img, folder, url))
+                try:
+                    for a in soup.find_all("a", href=True):
+                        n = normalize_url(a['href'], base=url)
+                        if n and urlparse(n).netloc == self.root_domain and n not in self.visited:
+                            to_visit.append(n)
+                except Exception:
+                    pass
+                pages_processed += 1
+                self.progress_fn(pages_processed, len(self.tasks))
+                time.sleep(REQUEST_DELAY)
+        finally:
+            driver.quit()
+        self.log_fn("Crawl finished.")
+        return self.tasks
+
+    def stop(self):
+        self.stop_event.set()
+
+def downloader_worker(tasks, log_fn, progress_fn, stop_event):
+    total = len(tasks)
+    success = 0
+    def download_task(t):
+        img_url, folder, page_url = t
+        if img_url.startswith("data:"):
+            fname = hashlib.sha1(img_url.encode()).hexdigest() + ".png"
+            out = ensure_unique_filepath(folder, fname)
+            ok = download_url_to_path(img_url, out)
+            if not ok:
+                log_fn(f"Failed to save data URI for {page_url}")
+            return ok
+        parsed = urlparse(img_url)
+        name = os.path.basename(parsed.path) or hashlib.sha1(img_url.encode()).hexdigest()
+        name = safe_name(name)
+        if not os.path.splitext(name)[1]:
+            name = name + (os.path.splitext(parsed.path)[1] or ".jpg")
+        out = ensure_unique_filepath(folder, name)
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            log_fn(f"Skipping (exists): {out}")
+            return True
+        ok = download_url_to_path(img_url, out, referer=page_url)
+        if ok:
+            log_fn(f"Saved: {out}")
+            return True
+        headers = {"User-Agent": USER_AGENT, "Referer": page_url}
+        try:
+            r = requests.get(img_url, headers=headers, stream=True, timeout=12)
+            if r.status_code == 200:
+                with open(out, "wb") as f:
+                    shutil.copyfileobj(r.raw, f)
+                log_fn(f"Saved after retry: {out}")
+                return True
+        except Exception:
+            pass
+        try:
+            driver = setup_driver(headless=True)
+            driver.get(page_url)
+            time.sleep(PAGE_RENDER_WAIT)
+            page_scroll(driver)
+            grabbed = False
+            imgs = driver.find_elements("tag name", "img")
+            for el in imgs:
+                try:
+                    src = el.get_attribute("src") or ""
+                    data_src = el.get_attribute("data-src") or ""
+                    srcset = el.get_attribute("srcset") or ""
+                    if img_url in src or img_url in data_src or img_url in srcset:
+                        png = el.screenshot_as_png
+                        save_binary(png, out)
+                        grabbed = True
+                        break
+                except Exception:
+                    continue
+            if not grabbed:
+                png = driver.get_screenshot_as_png()
+                save_binary(png, out)
+            driver.quit()
+            log_fn(f"Saved by screenshot: {out}")
+            return True
+        except Exception as e:
+            try:
+                driver.quit()
+            except Exception: pass
+            log_fn(f"Failed to save {img_url}: {e}")
+            return False
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as ex:
+        futures = {ex.submit(download_task, t): t for t in tasks}
+        done = 0
+        for fut in as_completed(futures):
+            if stop_event.is_set():
+                break
+            res = False
+            try:
+                res = fut.result()
+            except Exception:
+                res = False
+            done += 1
+            progress_fn(done, total)
+            if res: success += 1
+    return success, total
+
+
+# ----------------- GUI -----------------
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("Universal Image Scraper")
+        root.geometry("820x520")
+        self.url_var = tk.StringVar(value=DEFAULT_START)
+        self.start_btn = ttk.Button(root, text="Start", command=self.start)
+        self.stop_btn = ttk.Button(root, text="Stop", command=self.stop, state="disabled")
+        self.url_entry = ttk.Entry(root, textvariable=self.url_var, width=80)
+        self.log_text = scrolledtext.ScrolledText(root, height=20)
+        self.progress_label = ttk.Label(root, text="Idle")
+        self.pb = ttk.Progressbar(root, length=600)
+        ttk.Label(root, text="Website URL:").pack(anchor="w", padx=8, pady=(8,0))
+        self.url_entry.pack(anchor="w", padx=8)
+        self.start_btn.pack(anchor="w", padx=8, pady=6)
+        self.stop_btn.pack(anchor="w", padx=8)
+        self.progress_label.pack(anchor="w", padx=8, pady=(6,0))
+        self.pb.pack(anchor="w", padx=8, pady=4)
+        ttk.Label(root, text="Log:").pack(anchor="w", padx=8)
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=(0,8))
+        self.controller = None
+        self.worker_thread = None
+        self.stop_event = threading.Event()
+
+    def log(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        try:
+            self.log_text.insert("end", f"[{ts}] {msg}\n")
+            self.log_text.see("end")
+        except Exception:
+            pass
+
+    def update_progress(self, a, b):
+        try:
+            self.progress_label.config(text=f"Pages processed: {a} | Images found: {b}")
+        except Exception:
+            pass
+
+    def start(self):
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showerror("Error", "Enter a website URL")
+            return
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log("Starting crawl for: " + url)
+        self.controller = ScraperController(url, self.log, self.update_progress)
+        self.stop_event.clear()
+        self.worker_thread = threading.Thread(target=self.run_full_flow, daemon=True)
+        self.worker_thread.start()
+
+    def stop(self):
+        self.log("Stopping requested...")
+        self.start_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        if self.controller:
+            self.controller.stop()
+        self.stop_event.set()
+
+    def run_full_flow(self):
+        try:
+            tasks = self.controller.crawl()
+            if not tasks:
+                self.log("No images discovered.")
+                self.start_btn.config(state="normal")
+                self.stop_btn.config(state="disabled")
+                return
+            self.log(f"Total images discovered: {len(tasks)}")
+            self.pb.config(maximum=len(tasks))
+            seen = set()
+            dedup = []
+            for t in tasks:
+                k = t[0]
+                if k in seen: continue
+                seen.add(k)
+                dedup.append(t)
+            self.log(f"Distinct images to download: {len(dedup)}")
+            success, total = downloader_worker(dedup, self.log, lambda a,b: self.pb.step(1), self.stop_event)
+            self.log(f"Download finished: {success}/{total}")
+        finally:
+            self.start_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+
+# ---------- main ----------
+def main():
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
